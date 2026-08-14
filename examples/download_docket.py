@@ -4,7 +4,9 @@
 Given a docket number and a court, this script looks up the matching
 docket(s) and, for each one, collects the associated docket entries,
 parties, and attorneys. Everything is merged into a single JSON structure
-and written to a file.
+and written to its own file named ``<court>_<docket_number>.json`` (colons
+in the docket number are replaced with dashes), e.g.
+``cand_5-14-cv-01974.json``.
 
 You can look up a single docket with ``--docket-number``/``--court``, or
 process many at once by passing a CSV file with ``--csv``. The CSV must
@@ -17,14 +19,12 @@ have ``court`` and ``docket_number`` columns (order does not matter):
 Usage:
     export COURTLISTENER_API_TOKEN="your-token-here"
 
-    # Single lookup
+    # Single lookup, written to the current directory
     python examples/download_docket.py \
-        --docket-number "5:14-cv-01974" --court "cand" \
-        --output docket.json
+        --docket-number "5:14-cv-01974" --court "cand"
 
-    # Bulk lookup from a CSV
-    python examples/download_docket.py \
-        --csv dockets.csv --output dockets.json
+    # Bulk lookup from a CSV, all files written into ./out
+    python examples/download_docket.py --csv dockets.csv --output ./out
 
 Requires an authenticated client; see the project README for how to obtain
 an API token.
@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from typing import Any
 
@@ -81,6 +82,23 @@ def search_dockets(
     return list(results)
 
 
+def docket_filename(court: str, docket_number: str) -> str:
+    """Build a filesystem-safe ``<court>_<docket_number>.json`` name.
+
+    Colons in the docket number become dashes (e.g. ``5:14-cv-01974`` ->
+    ``5-14-cv-01974``); any path separators are also neutralized so the
+    name can never escape the output directory.
+    """
+    safe = docket_number.replace(":", "-")
+    for sep in (os.sep, os.altsep, "/"):
+        if sep:
+            safe = safe.replace(sep, "-")
+    court_safe = court.replace(os.sep, "-")
+    if os.altsep:
+        court_safe = court_safe.replace(os.altsep, "-")
+    return f"{court_safe}_{safe}.json"
+
+
 def bundles_for_query(
     client: CourtListener, docket_number: str, court: str
 ) -> list[dict[str, Any]]:
@@ -104,6 +122,20 @@ def bundles_for_query(
             file=sys.stderr,
         )
     return bundles
+
+
+def write_bundle(
+    bundle: dict[str, Any],
+    output_dir: str,
+    filename: str,
+    indent: int,
+) -> str:
+    """Write a single docket bundle to ``output_dir/filename``."""
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(bundle, handle, indent=indent, ensure_ascii=False)
+        handle.write("\n")
+    return path
 
 
 def read_csv_queries(path: str) -> list[dict[str, str]]:
@@ -146,8 +178,9 @@ def main() -> int:
         description=(
             "Search CourtListener by docket number and court, then download "
             "the docket, docket entries, parties, and attorneys merged into "
-            "one JSON file. Provide a single docket with --docket-number and "
-            "--court, or many via --csv."
+            "one JSON file per docket. Provide a single docket with "
+            "--docket-number and --court, or many via --csv. Each docket is "
+            "saved as <court>_<docket_number>.json (colons become dashes)."
         )
     )
     parser.add_argument(
@@ -168,8 +201,11 @@ def main() -> int:
     parser.add_argument(
         "-o",
         "--output",
-        default="dockets.json",
-        help="Path to write the merged JSON file (default: dockets.json).",
+        default=".",
+        help=(
+            "Directory to write the per-docket JSON files into "
+            "(default: current directory). Created if it does not exist."
+        ),
     )
     parser.add_argument(
         "--api-token",
@@ -220,52 +256,55 @@ def main() -> int:
         return 1
 
     try:
+        os.makedirs(args.output, exist_ok=True)
+    except OSError as exc:
+        print(f"Error creating output directory: {exc}", file=sys.stderr)
+        return 1
+
+    try:
         client = CourtListener(api_token=args.api_token)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    all_bundles: list[dict[str, Any]] = []
+    written = 0
     try:
         with client:
             for i, query in enumerate(queries, start=1):
+                court = query["court"]
+                docket_number = query["docket_number"]
                 print(
                     f"[{i}/{len(queries)}] Searching docket "
-                    f"'{query['docket_number']}' in court "
-                    f"'{query['court']}'...",
+                    f"'{docket_number}' in court '{court}'...",
                     file=sys.stderr,
                 )
-                all_bundles.extend(
-                    bundles_for_query(
-                        client,
-                        query["docket_number"],
-                        query["court"],
-                    )
+                bundles = bundles_for_query(
+                    client, docket_number, court
                 )
+                base = docket_filename(court, docket_number)
+                for bundle in bundles:
+                    # A single query can match more than one docket; keep
+                    # each file distinct by suffixing the docket id.
+                    filename = (
+                        base
+                        if len(bundles) == 1
+                        else f"{base[:-len('.json')]}_{bundle['id']}.json"
+                    )
+                    path = write_bundle(
+                        bundle, args.output, filename, args.indent
+                    )
+                    written += 1
+                    print(f"  Wrote {path}", file=sys.stderr)
     except CourtListenerAPIError as exc:
         print(f"API error: {exc}", file=sys.stderr)
         return 1
 
-    if not all_bundles:
+    if not written:
         print("No dockets found for any query.", file=sys.stderr)
         return 1
 
-    # For a single-docket lookup that matched exactly one docket, emit the
-    # bundle directly. Bulk runs (and multi-match single lookups) emit a
-    # JSON array so every result is preserved.
-    single_lookup = not args.csv
-    output_data: Any = (
-        all_bundles[0]
-        if single_lookup and len(all_bundles) == 1
-        else all_bundles
-    )
-
-    with open(args.output, "w", encoding="utf-8") as handle:
-        json.dump(output_data, handle, indent=args.indent, ensure_ascii=False)
-        handle.write("\n")
-
     print(
-        f"Wrote {len(all_bundles)} docket bundle(s) to {args.output}",
+        f"Wrote {written} docket file(s) to {args.output}",
         file=sys.stderr,
     )
     return 0
