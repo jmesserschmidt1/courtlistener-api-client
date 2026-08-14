@@ -8,6 +8,12 @@ and written to its own file named ``<court>_<docket_number>.json`` (colons
 in the docket number are replaced with dashes), e.g.
 ``cand_5-14-cv-01974.json``.
 
+To keep API usage low, attorneys are read from the nested data already
+present in the ``/parties/`` response, so a docket costs three requests
+(docket search + docket entries + parties) plus any pagination pages,
+rather than four. Use ``--separate-attorneys`` to instead pull full
+attorney contact records from the dedicated ``/attorneys/`` endpoint.
+
 You can look up a single docket with ``--docket-number``/``--court``, or
 process many at once by passing a CSV file with ``--csv``. The CSV must
 have ``court`` and ``docket_number`` columns (order does not matter):
@@ -57,18 +63,67 @@ def collect_related(
     return list(resource.list(docket=docket_id))
 
 
+def collect_parties(
+    client: CourtListener, docket_id: int
+) -> list[dict[str, Any]]:
+    """Return the docket's parties with their attorneys nested.
+
+    ``filter_nested_results`` scopes each party's embedded ``attorneys`` to
+    this docket, so a single ``/parties/`` request carries the attorney data
+    too and the separate ``/attorneys/`` call can be skipped.
+    """
+    return list(
+        client.parties.list(docket=docket_id, filter_nested_results=True)
+    )
+
+
+def attorneys_from_parties(
+    parties: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flatten and de-duplicate the attorneys embedded in ``parties``.
+
+    Each party carries an ``attorneys`` list; the same attorney can appear
+    under several parties, so entries are de-duplicated by attorney id
+    (falling back to ``attorney_id``). Entries without an id are kept as-is.
+    """
+    seen: dict[Any, dict[str, Any]] = {}
+    ordered: list[dict[str, Any]] = []
+    for party in parties:
+        for attorney in party.get("attorneys") or []:
+            key = attorney.get("id", attorney.get("attorney_id"))
+            if key is None:
+                ordered.append(attorney)
+            elif key not in seen:
+                seen[key] = attorney
+                ordered.append(attorney)
+    return ordered
+
+
 def build_docket_bundle(
-    client: CourtListener, docket: dict[str, Any]
+    client: CourtListener,
+    docket: dict[str, Any],
+    separate_attorneys: bool = False,
 ) -> dict[str, Any]:
-    """Merge a docket with its entries, parties, and attorneys."""
+    """Merge a docket with its entries, parties, and attorneys.
+
+    By default attorneys are taken from the nested data in the parties
+    response, saving a request. Pass ``separate_attorneys=True`` to fetch
+    full attorney records (name, contact, phone, email) from the dedicated
+    ``/attorneys/`` endpoint instead, at the cost of one more request.
+    """
     docket_id = docket["id"]
+    parties = collect_parties(client, docket_id)
+    if separate_attorneys:
+        attorneys = collect_related(client, "attorneys", docket_id)
+    else:
+        attorneys = attorneys_from_parties(parties)
     return {
         **docket,
         "docket_entries": collect_related(
             client, "docket_entries", docket_id
         ),
-        "parties": collect_related(client, "parties", docket_id),
-        "attorneys": collect_related(client, "attorneys", docket_id),
+        "parties": parties,
+        "attorneys": attorneys,
     }
 
 
@@ -100,7 +155,10 @@ def docket_filename(court: str, docket_number: str) -> str:
 
 
 def bundles_for_query(
-    client: CourtListener, docket_number: str, court: str
+    client: CourtListener,
+    docket_number: str,
+    court: str,
+    separate_attorneys: bool = False,
 ) -> list[dict[str, Any]]:
     """Search for a docket number/court and build bundles for each match."""
     dockets = search_dockets(client, docket_number, court)
@@ -112,7 +170,10 @@ def bundles_for_query(
         )
         return []
 
-    bundles = [build_docket_bundle(client, docket) for docket in dockets]
+    bundles = [
+        build_docket_bundle(client, docket, separate_attorneys)
+        for docket in dockets
+    ]
     for bundle in bundles:
         print(
             f"  Docket {bundle['id']}: "
@@ -221,6 +282,16 @@ def main() -> int:
         default=2,
         help="Indentation for the output JSON (default: 2).",
     )
+    parser.add_argument(
+        "--separate-attorneys",
+        action="store_true",
+        help=(
+            "Fetch full attorney records from the /attorneys/ endpoint "
+            "instead of deriving them from the nested parties data. Adds one "
+            "request (plus pagination) per docket but includes attorney "
+            "contact details."
+        ),
+    )
     args = parser.parse_args()
 
     # Validate the input mode: exactly one of CSV or a docket-number/court
@@ -279,7 +350,10 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 bundles = bundles_for_query(
-                    client, docket_number, court
+                    client,
+                    docket_number,
+                    court,
+                    separate_attorneys=args.separate_attorneys,
                 )
                 base = docket_filename(court, docket_number)
                 for bundle in bundles:
