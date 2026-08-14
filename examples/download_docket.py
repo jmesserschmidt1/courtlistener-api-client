@@ -14,6 +14,11 @@ present in the ``/parties/`` response, so a docket costs three requests
 rather than four. Use ``--separate-attorneys`` to instead pull full
 attorney contact records from the dedicated ``/attorneys/`` endpoint.
 
+Bulk runs are throttled to stay under CourtListener's rate limits: by
+default HTTP requests are spaced so any 60-second window holds fewer than
+15 (every page fetch counts). Tune this with ``--requests-per-minute``, or
+set it to 0 to disable throttling.
+
 You can look up a single docket with ``--docket-number``/``--court``, or
 process many at once by passing a CSV file with ``--csv``. The CSV must
 have ``court`` and ``docket_number`` columns (order does not matter):
@@ -43,12 +48,68 @@ import csv
 import json
 import os
 import sys
-from typing import Any
+import time
+from typing import Any, Callable
 
 from courtlistener import CourtListener
 from courtlistener.exceptions import CourtListenerAPIError
 
 REQUIRED_CSV_COLUMNS = ("court", "docket_number")
+
+# Stay comfortably under CourtListener's rate limits on bulk runs. This is a
+# ceiling on HTTP requests per minute (every page fetch counts). Fixed-interval
+# spacing lets the first request through immediately, so a rolling minute can
+# hold one more request than the nominal rate; 13/min therefore keeps every
+# 60-second window strictly under 15 requests.
+DEFAULT_REQUESTS_PER_MINUTE = 13.0
+
+
+class RateLimiter:
+    """Space out calls so no more than ``max_per_minute`` happen per minute.
+
+    Enforces a fixed minimum interval between successive ``wait()`` calls,
+    which caps the sustained rate. A non-positive ``max_per_minute``
+    disables throttling entirely.
+    """
+
+    def __init__(
+        self,
+        max_per_minute: float,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.min_interval = (
+            60.0 / max_per_minute if max_per_minute > 0 else 0.0
+        )
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._last: float | None = None
+
+    def wait(self) -> None:
+        """Block until enough time has passed since the previous call."""
+        if self.min_interval <= 0:
+            return
+        now = self._monotonic()
+        if self._last is not None:
+            elapsed = now - self._last
+            if elapsed < self.min_interval:
+                self._sleep(self.min_interval - elapsed)
+        self._last = self._monotonic()
+
+
+def install_rate_limit(client: CourtListener, limiter: RateLimiter) -> None:
+    """Throttle every HTTP request the client makes through ``limiter``.
+
+    Wrapping ``_request`` (rather than the per-docket helpers) ensures
+    pagination pages are throttled too, since each page is its own request.
+    """
+    original = client._request
+
+    def throttled(method: str, path: str, **kwargs: Any) -> Any:
+        limiter.wait()
+        return original(method, path, **kwargs)
+
+    client._request = throttled  # type: ignore[method-assign]
 
 
 def collect_related(
@@ -283,6 +344,16 @@ def main() -> int:
         help="Indentation for the output JSON (default: 2).",
     )
     parser.add_argument(
+        "--requests-per-minute",
+        type=float,
+        default=DEFAULT_REQUESTS_PER_MINUTE,
+        help=(
+            "Cap on HTTP requests per minute, counting every page fetch "
+            f"(default: {DEFAULT_REQUESTS_PER_MINUTE:g}, keeping any 60s "
+            "window under 15). Set to 0 to disable throttling."
+        ),
+    )
+    parser.add_argument(
         "--separate-attorneys",
         action="store_true",
         help=(
@@ -337,6 +408,15 @@ def main() -> int:
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+
+    if args.requests_per_minute > 0:
+        install_rate_limit(
+            client, RateLimiter(args.requests_per_minute)
+        )
+        print(
+            f"Throttling to {args.requests_per_minute:g} requests/minute.",
+            file=sys.stderr,
+        )
 
     written = 0
     try:
